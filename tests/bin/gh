@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fake gh for tests. Serves pull requests from $FAKE_GH_PRS (a JSON array).
+#   FAKE_GH_FAIL=1          every call fails
+#   FAKE_GH_FRESH=<file>    `pr list --head` (the re-check before removal) reads this file instead
+set -euo pipefail
+[ "${FAKE_GH_FAIL:-0}" = 1 ] && { echo "gh: simulated failure" >&2; exit 1; }
+
+case "${1:-} ${2:-}" in
+  "auth token") echo "fake-token"; exit 0 ;;
+  "pr list") ;;
+  *) echo "fake gh: unsupported: $*" >&2; exit 2 ;;
+esac
+
+head=""; file="$FAKE_GH_PRS"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --head) head="$2"; file="${FAKE_GH_FRESH:-$FAKE_GH_PRS}"; shift ;;
+  esac
+  shift
+done
+if [ -n "$head" ]; then jq --arg h "$head" '[.[] | select(.headRefName == $h)]' "$file"
+else cat "$file"; fi

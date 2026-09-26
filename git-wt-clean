@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# git-wt-clean — find git worktrees whose work is finished, and remove them safely.
+# https://github.com/<owner>/git-wt-clean · MIT license
+#
+# Runs on bash 3.2 (macOS) and later. Needs git >= 2.36; jq and gh are optional.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+git-wt-clean — find git worktrees whose work is finished, and remove them safely.
+
+Usage:
+  git-wt-clean status [options] [PATH...]   show every linked worktree and its verdict
+  git-wt-clean remove [options] [PATH...]   remove the REMOVE rows, prune the PRUNE rows
+
+PATH is a repository, or a folder whose direct children are repositories.
+Default: the repository you are in, otherwise the children of the current folder.
+
+Options:
+  --yes, -y            remove without asking
+  --delete-branches    after removing a worktree, delete its local branch too
+  --no-fetch           do not fetch; compare against the remote-tracking refs you have
+  --no-forge           do not ask GitHub about pull requests (plain git only)
+  --disposable LIST    comma-separated ignored names that may be deleted
+                       (default: node_modules,target,dist,build,... see README)
+  --json               status only: one JSON object per worktree (needs jq)
+  -h, --help           show this help
+  --version            print the version
+
+Verdicts (first match wins):
+  PRUNE   git still lists it, but its folder is gone
+  KEEP    locked, in use, uncommitted changes, ignored files that are not disposable,
+          an open pull request, or commits that exist only in this worktree
+  REMOVE  every change is already in the default branch (merged, rebased, squashed),
+          or its pull request was merged or closed at exactly this commit
+  REVIEW  none of the above could be proven; never removed automatically
+
+Exit codes: 0 success or nothing to do, 1 a removal failed or was aborted,
+            2 bad usage, 3 missing dependency.
+EOF
+}
+
+# ---------------------------------------------------------------- options
+
+CMD=""; YES=no; DELETE_BRANCHES=no; FETCH=yes; FORGE=yes; JSON=no
+DISPOSABLE="node_modules,target,dist,build,out,.next,.nuxt,.svelte-kit,.turbo,.cache,.parcel-cache,coverage,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,.venv,venv,.tox,.gradle,.bsp,.metals,.bloop,.idea,.DS_Store,*.pyc,*.class"
+ROOTS=()
+
+die() { printf 'git-wt-clean: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    status|remove) [ -z "$CMD" ] || die "only one command allowed"; CMD="$1" ;;
+    help|-h|--help) usage; exit 0 ;;
+    --version|version) echo "git-wt-clean $VERSION"; exit 0 ;;
+    -y|--yes) YES=yes ;;
+    --delete-branches) DELETE_BRANCHES=yes ;;
+    --no-fetch) FETCH=no ;;
+    --no-forge) FORGE=no ;;
+    --json) JSON=yes ;;
+    --disposable) [ $# -ge 2 ] || die "--disposable needs a value"; DISPOSABLE="$2"; shift ;;
+    --disposable=*) DISPOSABLE="${1#--disposable=}" ;;
+    --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done; break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) ROOTS+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$CMD" ] || { usage >&2; exit 2; }
+[ "$JSON" = yes ] && [ "$CMD" != status ] && die "--json works with status only"
+
+# ---------------------------------------------------------------- dependencies
+
+command -v git >/dev/null || die "git not found" 3
+gv=$(git version | sed -E 's/^git version ([0-9]+)\.([0-9]+).*/\1 \2/')
+# shellcheck disable=SC2086  # split "2 39" into two words on purpose
+set -- $gv
+if [ "${1:-0}" -lt 2 ] || { [ "$1" -eq 2 ] && [ "${2:-0}" -lt 36 ]; }; then
+  die "git >= 2.36 is required (found $(git version))" 3
+fi
+set --
+
+WARNINGS=()
+HAVE_JQ=no; command -v jq >/dev/null && HAVE_JQ=yes
+[ "$JSON" = yes ] && [ "$HAVE_JQ" = no ] && die "--json needs jq" 3
+if [ "$FORGE" = yes ]; then
+  if ! command -v gh >/dev/null; then FORGE=no
+  elif [ "$HAVE_JQ" = no ]; then FORGE=no; WARNINGS+=("jq not found: skipping pull-request checks")
+  fi
+fi
+[ "$FORGE" = yes ] && [ -z "${GH_TOKEN:-}" ] && GH_TOKEN=$(gh auth token 2>/dev/null) && export GH_TOKEN
+
+export GIT_TERMINAL_PROMPT=0 GIT_LITERAL_PATHSPECS=1
+SSH_CMD="ssh -o BatchMode=yes -o ConnectTimeout=10"
+
+# ---------------------------------------------------------------- output helpers
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_KEEP=$'\033[32m' C_REVIEW=$'\033[33m' C_REMOVE=$'\033[31m' C_PRUNE=$'\033[36m'
+  C_DIM=$'\033[2m' C_B=$'\033[1m' C_0=$'\033[0m'
+else
+  C_KEEP="" C_REVIEW="" C_REMOVE="" C_PRUNE="" C_DIM="" C_B="" C_0=""
+fi
+TTY_ERR=no; [ -t 2 ] && TTY_ERR=yes
+
+# A transient status line on stderr: redrawn in a terminal, silent otherwise.
+progress()      { [ "$TTY_ERR" = yes ] && printf '\r\033[K%s%s%s' "$C_DIM" "$*" "$C_0" >&2; return 0; }
+progress_done() { [ "$TTY_ERR" = yes ] && printf '\r\033[K' >&2; return 0; }
+say()           { progress_done; printf '%s\n' "$*"; }
+
+color() {
+  case "$1" in
+    KEEP) printf '%s' "$C_KEEP" ;; REVIEW) printf '%s' "$C_REVIEW" ;;
+    REMOVE) printf '%s' "$C_REMOVE" ;; PRUNE) printf '%s' "$C_PRUNE" ;;
+  esac
+}
+human() {  # kilobytes -> 1.2G / 340M / 12K
+  awk -v k="${1:-0}" 'BEGIN { split("K M G T", u, " "); i = 1
+    while (k >= 1024 && i < 4) { k /= 1024; i++ }
+    printf((k < 10 && i > 1) ? "%.1f%s" : "%d%s", k, u[i]) }'
+}
+fit() {  # fit TEXT WIDTH: keep the end of long text, which is the informative part
+  local s="$1" w="$2"
+  if [ "${#s}" -gt "$w" ]; then printf '…%s' "${s:$(( ${#s} - w + 1 ))}"; else printf '%s' "$s"; fi
+}
+now() { date +%s; }
+disk_free_kb()  { df -Pk "$1" | awk 'NR == 2 { print $4 }'; }
+disk_total_kb() { df -Pk "$1" | awk 'NR == 2 { print $2 }'; }
+display_path() {
+  local p="$1" r
+  for r in "${ROOT_DIRS[@]}"; do
+    case "$p" in "$r"/*) printf '%s' "${p#"$r"/}"; return ;; esac
+  done
+  # shellcheck disable=SC2088  # a literal ~ for display
+  case "$p" in "$HOME"/*) printf '~/%s' "${p#"$HOME"/}" ;; *) printf '%s' "$p" ;; esac
+}
+
+# ---------------------------------------------------------------- discovery
+
+# Repositories, one entry per git common dir.
+R_PATH=(); R_COMMON=(); R_REMOTE=(); R_TARGET=(); R_FETCH=(); R_SLUG=(); R_PRS=()
+# Linked worktrees.
+W_REPO=(); W_PATH=(); W_BRANCH=(); W_LOCKED=()
+ROOT_DIRS=()
+
+add_repo() {
+  local dir="$1" common i
+  common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  for (( i = 0; i < ${#R_COMMON[@]}; i++ )); do [ "${R_COMMON[$i]}" = "$common" ] && return 0; done
+  R_PATH+=("$dir"); R_COMMON+=("$common")
+}
+
+discover_repos() {
+  local root d
+  if [ ${#ROOTS[@]} -eq 0 ]; then
+    if git rev-parse --git-dir >/dev/null 2>&1; then ROOTS=("$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
+    else ROOTS=("$(pwd)"); fi
+  fi
+  for root in "${ROOTS[@]}"; do
+    [ -d "$root" ] || die "no such folder: $root"
+    root=$(cd "$root" && pwd -P)
+    ROOT_DIRS+=("$root")
+    if [ -e "$root/.git" ] || git -C "$root" rev-parse --is-bare-repository 2>/dev/null | grep -q true; then
+      add_repo "$root"
+    else
+      for d in "$root"/*/; do
+        d=${d%/}
+        [ -e "$d/.git" ] && add_repo "$d"
+      done
+    fi
+  done
+}
+
+# Reads `git worktree list --porcelain -z` for repo $1 and appends its linked worktrees.
+# NUL-separated, so paths with spaces, tabs or newlines survive.
+read_worktrees() {
+  local ri="$1" repo="${R_PATH[$1]}" field path="" branch="" locked="" first=yes
+  flush() {
+    if [ -n "$path" ]; then
+      if [ "$first" = yes ]; then first=no          # the main worktree is never a candidate
+      else W_REPO+=("$ri"); W_PATH+=("$path"); W_BRANCH+=("$branch"); W_LOCKED+=("$locked"); fi
+    fi
+    path=""; branch=""; locked=""
+  }
+  while IFS= read -r -d '' field; do
+    case "$field" in
+      "") flush ;;
+      "worktree "*) path=${field#worktree } ;;
+      "branch refs/heads/"*) branch=${field#branch refs/heads/} ;;
+      locked|"locked "*) locked=yes ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain -z 2>/dev/null)
+  flush
+}
+
+pick_remote() {  # the upstream of the main worktree's branch, else origin, else the first remote
+  local repo="$1" up
+  up=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) &&
+    [ -n "$up" ] && git -C "$repo" remote | grep -qxF "${up%%/*}" && { printf '%s' "${up%%/*}"; return; }
+  git -C "$repo" remote | grep -qx origin && { printf origin; return; }
+  git -C "$repo" remote | head -n 1
+}
+
+pick_target() {  # the default branch to compare against, as a ref name
+  local repo="$1" remote="$2" ref c
+  if [ -n "$remote" ]; then
+    ref=$(git -C "$repo" symbolic-ref -q "refs/remotes/$remote/HEAD" 2>/dev/null) && { printf '%s' "$ref"; return; }
+    for c in main master trunk develop; do
+      git -C "$repo" rev-parse -q --verify "refs/remotes/$remote/$c" >/dev/null && { printf 'refs/remotes/%s/%s' "$remote" "$c"; return; }
+    done
+  fi
+  for c in main master trunk; do
+    git -C "$repo" rev-parse -q --verify "refs/heads/$c" >/dev/null && { printf 'refs/heads/%s' "$c"; return; }
+  done
+}
+
+github_slug() {  # owner/repo from any GitHub remote URL form; empty if not GitHub
+  local url; url=$(git -C "$1" remote get-url "$2" 2>/dev/null) || return 0
+  case "$url" in *github*) ;; *) return 0 ;; esac
+  printf '%s' "$url" | sed -E 's#\.git$##; s#/+$##; s#^.*[:/]([^/:]+/[^/:]+)$#\1#'
+}
+
+prepare_repos() {
+  local i n=${#R_PATH[@]} repo remote nwt before
+  for (( i = 0; i < n; i++ )); do
+    repo=${R_PATH[$i]}
+    before=${#W_PATH[@]}
+    read_worktrees "$i"
+    nwt=$(( ${#W_PATH[@]} - before ))
+    R_REMOTE[i]=""; R_TARGET[i]=""; R_FETCH[i]=skipped; R_SLUG[i]=""; R_PRS[i]=""
+    [ "$nwt" -gt 0 ] || continue                  # only repos with linked worktrees cost anything
+    remote=$(pick_remote "$repo")
+    R_REMOTE[i]=$remote
+    if [ -n "$remote" ] && [ "$FETCH" = yes ]; then
+      progress "[$((i + 1))/$n] fetching $(basename "$repo") from ${remote}…"
+      if git -C "$repo" -c core.sshCommand="$SSH_CMD" fetch --quiet --prune "$remote" 2>/dev/null
+      then R_FETCH[i]=yes
+      else R_FETCH[i]=no; WARNINGS+=("could not fetch $(basename "$repo") from $remote; using refs from the last fetch")
+      fi
+    fi
+    R_TARGET[i]=$(pick_target "$repo" "$remote")
+    if [ "$FORGE" = yes ] && [ -n "$remote" ]; then
+      R_SLUG[i]=$(github_slug "$repo" "$remote")
+      if [ -n "${R_SLUG[$i]}" ]; then
+        progress "[$((i + 1))/$n] listing pull requests for ${R_SLUG[$i]}…"
+        R_PRS[i]=$(gh pr list -R "${R_SLUG[$i]}" --state all --limit 500 \
+          --json number,headRefName,headRefOid,state,isCrossRepository 2>/dev/null) || R_PRS[i]="ERR"
+      fi
+    fi
+  done
+  progress_done
+}
+
+# Every process's current directory, as "path<TAB>command" lines.
+CWDS=""
+collect_cwds() {
+  local p c
+  if [ -r /proc/self/cwd ] 2>/dev/null && [ -d /proc/1 ]; then
+    for p in /proc/[0-9]*; do
+      c=$(readlink "$p/cwd" 2>/dev/null) || continue
+      CWDS+="$c"$'\t'"$(cat "$p/comm" 2>/dev/null)"$'\n'
+    done
+  elif command -v lsof >/dev/null; then
+    CWDS=$(lsof -w -d cwd -Fcn 2>/dev/null | awk '/^c/ { c = substr($0, 2) } /^n/ { print substr($0, 2) "\t" c }')
+  else
+    WARNINGS+=("neither /proc nor lsof is available: cannot tell whether a worktree is open in a shell")
+  fi
+}
+
+# ---------------------------------------------------------------- evaluation
+
+is_disposable() {  # is_disposable PATH: true if the path, or any folder above it, is disposable
+  local path="${1%/}" part pat IFS rc=1
+  set -f                                   # patterns like *.pyc must not glob against files
+  IFS=/
+  # shellcheck disable=SC2086  # split on / on purpose
+  set -- $path
+  IFS=,
+  for part in "$@"; do
+    for pat in $DISPOSABLE; do
+      # shellcheck disable=SC2254
+      case "$part" in $pat) rc=0; break 2 ;; esac
+    done
+  done
+  set +f
+  return $rc
+}
+
+# How HEAD's work is already in TARGET, or return 1. Four independent proofs, cheapest first.
+landed_in() {
+  local wt="$1" target="$2" head mb pid
+  head=$(git -C "$wt" rev-parse HEAD) || return 1
+  if git -C "$wt" merge-base --is-ancestor "$head" "$target" 2>/dev/null; then echo "merged"; return 0; fi
+  mb=$(git -C "$wt" merge-base "$head" "$target" 2>/dev/null) || return 1
+  if [ -z "$(git -C "$wt" diff --name-only "$mb" "$head")" ]; then echo "no changes of its own"; return 0; fi
+  # Every file this branch touched is identical in the target: nothing here is missing there.
+  if git -C "$wt" diff --name-only -z "$mb" "$head" |
+       xargs -0 git -C "$wt" diff --quiet "$head" "$target" -- 2>/dev/null; then
+    echo "content already in target"; return 0
+  fi
+  # Squash merge: the branch's combined diff equals one commit on the target.
+  pid=$(git -C "$wt" diff-tree -p "$mb" "$head" | git patch-id --stable | cut -d' ' -f1)
+  if [ -n "$pid" ] && git -C "$wt" log -p --no-merges -n 5000 --pretty='format:commit %H' "$mb..$target" |
+       git patch-id --stable | grep -q "^$pid "; then
+    echo "squash-merged"; return 0
+  fi
+  # Rebase merge: every commit has an equivalent patch on the target.
+  local cherry
+  cherry=$(git -C "$wt" cherry "$target" "$head" 2>/dev/null) || return 1
+  if [ -n "$cherry" ] && ! grep -q '^+' <<<"$cherry"; then echo "rebased"; return 0; fi
+  return 1
+}
+
+pr_for_branch() {  # pr_for_branch REPO_INDEX BRANCH: JSON of the newest same-repo PR, "", or ERR
+  local ri="$1" br="$2" json
+  if [ "${FRESH:-no}" = yes ]; then
+    json=$(gh pr list -R "${R_SLUG[$ri]}" --head "$br" --state all --limit 20 \
+      --json number,headRefName,headRefOid,state,isCrossRepository 2>/dev/null) || { echo ERR; return; }
+  else
+    json=${R_PRS[$ri]}
+    [ "$json" = ERR ] && { echo ERR; return; }
+  fi
+  # isCrossRepository: a fork's PR with the same branch name is somebody else's work.
+  jq -c --arg b "$br" '[.[] | select(.headRefName == $b and (.isCrossRepository | not))][0] // empty' <<<"$json"
+}
+
+# Sets V, WHY, CHANGES, UNPUSHED, PR, AGE, SIZE_KB for worktree index $1.
+evaluate() {
+  local wi="$1" ri wt br real open entry xy f skip=no n_changes=0 kept_ignored="" target how head
+  local prj prstate prhead prnum
+  ri=${W_REPO[$wi]}; wt=${W_PATH[$wi]}; br=${W_BRANCH[$wi]}; target=${R_TARGET[$ri]}
+  CHANGES="-"; UNPUSHED="-"; PR="-"; AGE="-"; SIZE_KB=""
+
+  if [ ! -d "$wt" ]; then V=PRUNE; WHY="folder is gone"; return; fi
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || { V=REVIEW; WHY="not a readable git worktree"; return; }
+  AGE=$(( ( $(now) - $(git -C "$wt" log -1 --format=%ct 2>/dev/null || now) ) / 86400 ))
+
+  if [ -n "${W_LOCKED[$wi]}" ]; then V=KEEP; WHY="locked"; return; fi
+
+  real=$(cd "$wt" 2>/dev/null && pwd -P) || real=$wt
+  open=$(awk -F'\t' -v w="$real" '$1 == w || index($1, w "/") == 1 { print $2 }' <<<"$CWDS" | sort -u | paste -sd, -)
+  if [ -n "$open" ]; then V=KEEP; WHY="in use by $open"; return; fi
+
+  # Changes git knows about, plus ignored files that `git worktree remove` would delete.
+  while IFS= read -r -d '' entry; do
+    if [ "$skip" = yes ]; then skip=no; continue; fi           # the old name of a rename
+    xy=${entry:0:2}; f=${entry:3}
+    case "$xy" in
+      R*|C*) skip=yes; n_changes=$((n_changes + 1)) ;;
+      '!!') is_disposable "$f" || kept_ignored+="${kept_ignored:+, }${f%/}" ;;
+      *) n_changes=$((n_changes + 1)) ;;
+    esac
+  done < <(git -C "$wt" status --porcelain=v1 -z --ignored 2>/dev/null)
+  CHANGES=$n_changes
+  if [ "$n_changes" -gt 0 ]; then V=KEEP; WHY="$n_changes uncommitted change(s)"; return; fi
+  if [ -n "$kept_ignored" ]; then V=KEEP; WHY="ignored files would be lost: $(fit "$kept_ignored" 60)"; return; fi
+
+  UNPUSHED=$(git -C "$wt" rev-list --count "$head" --not --remotes 2>/dev/null || echo "?")
+
+  if [ -n "$br" ] && [ -n "${R_SLUG[$ri]}" ]; then
+    prj=$(pr_for_branch "$ri" "$br")
+    if [ "$prj" = ERR ]; then PR="?"
+    elif [ -n "$prj" ]; then
+      prnum=$(jq -r .number <<<"$prj"); prstate=$(jq -r .state <<<"$prj"); prhead=$(jq -r .headRefOid <<<"$prj")
+      PR="#$prnum $(printf '%s' "$prstate" | tr '[:upper:]' '[:lower:]')"
+    else PR="none"
+    fi
+  fi
+  if [ "${prstate:-}" = OPEN ]; then V=KEEP; WHY="PR #$prnum is open"; return; fi
+
+  if [ -n "$target" ] && how=$(landed_in "$wt" "$target"); then
+    V=REMOVE; WHY="$how into ${target#refs/remotes/}"
+    [ "${R_FETCH[$ri]}" = no ] && WHY+=" (remote not refreshed)"
+  elif [ "${prstate:-}" = MERGED ] || [ "${prstate:-}" = CLOSED ]; then
+    # The PR's head must contain everything here: equal, or HEAD is its ancestor.
+    if [ "$prhead" = "$head" ] || { git -C "$wt" cat-file -e "$prhead^{commit}" 2>/dev/null &&
+                                    git -C "$wt" merge-base --is-ancestor "$head" "$prhead"; }; then
+      V=REMOVE
+      if [ "$prstate" = MERGED ]; then WHY="PR #$prnum merged"
+      else WHY="PR #$prnum closed without merging (commits kept on GitHub)"; fi
+    elif [ "$UNPUSHED" != 0 ]; then V=KEEP; WHY="$UNPUSHED commit(s) exist only here (made after PR #$prnum)"
+    else V=REVIEW; WHY="PR #$prnum $(printf '%s' "$prstate" | tr '[:upper:]' '[:lower:]'), but HEAD differs from it"
+    fi
+  elif [ "$UNPUSHED" != 0 ]; then V=KEEP; WHY="$UNPUSHED commit(s) exist only here"
+  elif [ -z "${R_REMOTE[$ri]}" ] && [ -z "$target" ]; then V=REVIEW; WHY="no remote or default branch to compare with"
+  elif [ "$PR" = "?" ]; then V=REVIEW; WHY="could not read pull requests"
+  else V=REVIEW; WHY="pushed, but not merged into the default branch"
+  fi
+
+  case "$V" in REMOVE|REVIEW) SIZE_KB=$(du -sk "$wt" 2>/dev/null | cut -f1) ;; esac
+}
+
+# ---------------------------------------------------------------- scan
+
+START=$(now)
+discover_repos
+collect_cwds
+[ ${#R_PATH[@]} -gt 0 ] || die "no git repositories found under: ${ROOTS[*]}" 0
+FREE0=$(disk_free_kb "${ROOT_DIRS[0]}"); TOTAL=$(disk_total_kb "${ROOT_DIRS[0]}")
+
+if [ "$JSON" = no ]; then
+  printf '%sgit-wt-clean %s%s  %s%s — disk: %s free of %s%s\n\n' "$C_B" "$CMD" "$C_0" "$C_DIM" \
+    "$(display_path "${ROOT_DIRS[0]}")$([ ${#ROOT_DIRS[@]} -gt 1 ] && echo " +$(( ${#ROOT_DIRS[@]} - 1 ))")" \
+    "$(human "$FREE0")" "$(human "$TOTAL")" "$C_0"
+fi
+
+prepare_repos
+N=${#W_PATH[@]}
+if [ "$N" -eq 0 ]; then [ "$JSON" = yes ] || echo "No linked worktrees found."; exit 0; fi
+
+E_V=(); E_WHY=(); E_SIZE=()
+n_keep=0; n_review=0; n_remove=0; n_prune=0; kb_remove=0; kb_review=0
+
+row() {  # VERDICT WORKTREE BRANCH CHANGES UNPUSHED PR AGE SIZE REASON
+  printf '%s%-7s%s %-44s %-30s %7s %8s %-12s %4s %6s  %s\n' "$(color "$1")" "$1" "$C_0" \
+    "$(fit "$2" 44)" "$(fit "$3" 30)" "$4" "$5" "$6" "$7" "$8" "$9"
+}
+json_row() {
+  jq -nc --arg verdict "$V" --arg reason "$WHY" --arg path "${W_PATH[$1]}" --arg branch "${W_BRANCH[$1]}" \
+    --arg repo "${R_PATH[${W_REPO[$1]}]}" --arg changes "$CHANGES" --arg unpushed "$UNPUSHED" --arg pr "$PR" \
+    --arg age "$AGE" --arg size "${SIZE_KB:-}" \
+    '{verdict: $verdict, reason: $reason, path: $path, branch: (if $branch == "" then null else $branch end),
+      repo: $repo, changes: ($changes | tonumber? // null), unpushed: ($unpushed | tonumber? // null),
+      pr: (if $pr == "-" then null else $pr end), age_days: ($age | tonumber? // null),
+      size_kb: ($size | tonumber? // null)}'
+}
+
+[ "$CMD" = status ] && [ "$JSON" = no ] && row VERDICT WORKTREE BRANCH CHANGES UNPUSHED PR AGE_D SIZE REASON
+for (( i = 0; i < N; i++ )); do
+  progress "[$((i + 1))/$N] checking $(display_path "${W_PATH[$i]}")…"
+  evaluate "$i"
+  E_V[i]=$V; E_WHY[i]=$WHY; E_SIZE[i]=${SIZE_KB:-}
+  case "$V" in
+    KEEP) n_keep=$((n_keep + 1)) ;;
+    REVIEW) n_review=$((n_review + 1)); kb_review=$((kb_review + ${SIZE_KB:-0})) ;;
+    REMOVE) n_remove=$((n_remove + 1)); kb_remove=$((kb_remove + ${SIZE_KB:-0})) ;;
+    PRUNE) n_prune=$((n_prune + 1)) ;;
+  esac
+  if [ "$CMD" = status ]; then
+    progress_done
+    if [ "$JSON" = yes ]; then json_row "$i"
+    else
+      size="-"; [ -n "${SIZE_KB:-}" ] && size=$(human "$SIZE_KB")
+      row "$V" "$(display_path "${W_PATH[$i]}")" "${W_BRANCH[$i]:-(detached)}" "$CHANGES" "$UNPUSHED" "$PR" "$AGE" "$size" "$WHY"
+    fi
+  fi
+done
+progress_done
+
+summary() {
+  local w
+  printf '  %skeep %d%s · %sreview %d%s (%s) · %sremove %d%s · %sprune %d%s\n' \
+    "$C_KEEP" "$n_keep" "$C_0" "$C_REVIEW" "$n_review" "$C_0" "$(human "$kb_review")" \
+    "$C_REMOVE" "$n_remove" "$C_0" "$C_PRUNE" "$n_prune" "$C_0"
+  printf '  can be freed: %s%s%s  ·  disk free: %s of %s  ·  %d worktrees in %ds\n' \
+    "$C_B" "$(human "$kb_remove")" "$C_0" "$(human "$FREE0")" "$(human "$TOTAL")" "$N" "$(( $(now) - START ))"
+  for w in ${WARNINGS[@]+"${WARNINGS[@]}"}; do printf '  %swarning: %s%s\n' "$C_REVIEW" "$w" "$C_0"; done
+}
+
+if [ "$CMD" = status ]; then
+  [ "$JSON" = yes ] && exit 0
+  echo; summary
+  [ $((n_remove + n_prune)) -gt 0 ] && printf '\n  next: %sgit-wt-clean remove%s\n' "$C_B" "$C_0"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- remove
+
+PLAN=()
+for (( i = 0; i < N; i++ )); do
+  case "${E_V[$i]}" in REMOVE|PRUNE) PLAN+=("$i") ;; esac
+done
+if [ ${#PLAN[@]} -eq 0 ]; then echo "Nothing is safe to remove."; echo; summary; exit 0; fi
+
+echo "Plan:"
+for i in "${PLAN[@]}"; do
+  size="-"; [ -n "${E_SIZE[$i]}" ] && size=$(human "${E_SIZE[$i]}")
+  printf '  %s%-7s%s %6s  %s  %s%s%s\n' "$(color "${E_V[$i]}")" "${E_V[$i]}" "$C_0" "$size" \
+    "$(display_path "${W_PATH[$i]}")" "$C_DIM" "${E_WHY[$i]}" "$C_0"
+done
+echo; summary; echo
+
+if [ "$YES" != yes ]; then
+  ans=""
+  printf 'Remove %d worktree(s) (%s) and prune %d? [y/N] ' "$n_remove" "$(human "$kb_remove")" "$n_prune"
+  { read -r ans </dev/tty; } 2>/dev/null || true      # no terminal: empty answer, so abort
+  case "$ans" in y|Y|yes) echo ;; *) echo; echo "Aborted. Nothing changed."; exit 1 ;; esac
+fi
+
+done_n=0; failed=0; skipped=0; kb_freed=0; step=0; total_steps=${#PLAN[@]}
+for i in "${PLAN[@]}"; do
+  step=$((step + 1)); tag="[$step/$total_steps]"
+  wt=${W_PATH[$i]}; ri=${W_REPO[$i]}; repo=${R_PATH[$ri]}; br=${W_BRANCH[$i]}
+  progress "$tag re-checking $(display_path "$wt")…"
+  FRESH=yes evaluate "$i"                                  # state may have changed since the plan
+  if [ "$V" != "${E_V[$i]}" ]; then
+    say "$tag ${C_REVIEW}SKIP${C_0}    $(display_path "$wt") — now $V: $WHY"; skipped=$((skipped + 1)); continue
+  fi
+  t0=$(now)
+  if [ "$V" = PRUNE ]; then
+    progress "$tag pruning $(display_path "$wt")…"
+    if git -C "$repo" worktree prune; then say "$tag ${C_PRUNE}PRUNED${C_0}  $(display_path "$wt")"; done_n=$((done_n + 1))
+    else say "$tag ${C_REMOVE}FAILED${C_0}  prune in $(display_path "$repo")"; failed=$((failed + 1)); fi
+    continue
+  fi
+  progress "$tag removing $(display_path "$wt") ($(human "${SIZE_KB:-0}"))…"
+  # Never --force: git refuses on anything unexpected, a second line of defence.
+  if err=$(git -C "$repo" worktree remove "$wt" 2>&1); then
+    kb_freed=$((kb_freed + ${SIZE_KB:-0})); done_n=$((done_n + 1))
+    note=""
+    if [ -n "$br" ]; then
+      if [ "$DELETE_BRANCHES" = yes ]; then
+        if git -C "$repo" branch -D "$br" >/dev/null 2>&1; then note="branch $br deleted"; else note="branch $br kept (delete failed)"; fi
+      else note="branch $br kept"; fi
+    fi
+    say "$tag ${C_KEEP}REMOVED${C_0} $(display_path "$wt")  $(human "${SIZE_KB:-0}") in $(( $(now) - t0 ))s  ${C_DIM}${note}${C_0}"
+  else
+    failed=$((failed + 1))
+    say "$tag ${C_REMOVE}FAILED${C_0}  $(display_path "$wt"): $err"
+  fi
+done
+progress_done
+
+FREE1=$(disk_free_kb "${ROOT_DIRS[0]}")
+echo
+printf '%sDone%s in %ds: %d done, %d skipped, %d failed\n' "$C_B" "$C_0" "$(( $(now) - START ))" "$done_n" "$skipped" "$failed"
+printf '  freed:     %s%s%s  (sum of removed worktree sizes)\n' "$C_B" "$(human "$kb_freed")" "$C_0"
+printf '  disk free: %s → %s of %s  %s(some filesystems release space a moment later)%s\n' \
+  "$(human "$FREE0")" "$(human "$FREE1")" "$(human "$TOTAL")" "$C_DIM" "$C_0"
+[ "$failed" -eq 0 ] || exit 1
+exit 0

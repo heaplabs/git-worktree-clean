@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash: bash
+          - os: macos-latest
+            bash: bash          # Homebrew bash 5
+          - os: macos-latest
+            bash: /bin/bash     # the bash 3.2 macOS ships
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.bash }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats jq shellcheck
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core shellcheck jq
+      - run: make lint
+      - run: WT_BASH='${{ matrix.bash }}' bats tests/
