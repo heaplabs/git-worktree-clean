@@ -1,4 +1,4 @@
-# git-wt-clean
+# git-worktree-clean
 
 Find the git worktrees whose work is finished, and remove them without losing anything.
 
@@ -11,8 +11,8 @@ there is anything in it that exists nowhere else. That is what this tool does.
 Example session (names shortened):
 
 ```
-$ git-wt-clean status ~/projects
-git-wt-clean status  ~/projects — disk: 12G free of 228G
+$ git-worktree-clean status ~/projects
+git-worktree-clean status  ~/projects — disk: 12G free of 228G
 
 VERDICT WORKTREE              BRANCH              CHANGES UNPUSHED PR          AGE_D   SIZE  REASON
 REMOVE  app-wt-login          feat/login                0        2 #812 merged     3   421M  squash-merged into origin/main
@@ -25,9 +25,9 @@ PRUNE   /tmp/review-88        (detached)                -        - -            
   keep 3 · review 1 (1.2M) · remove 1 · prune 1
   can be freed: 421M  ·  disk free: 12G of 228G  ·  6 worktrees in 9s
 
-  next: git-wt-clean remove
+  next: git-worktree-clean remove
 
-$ git-wt-clean remove ~/projects
+$ git-worktree-clean remove ~/projects
 ...
 [1/2] REMOVED app-wt-login  421M in 3s  branch feat/login kept
 [2/2] PRUNED  /tmp/review-88
@@ -83,18 +83,18 @@ Optional: [`gh`](https://cli.github.com/) (logged in) and `jq` for pull-request 
 and `jq` for `--json`.
 
 ```bash
-curl -fsSLo ~/.local/bin/git-wt-clean https://raw.githubusercontent.com/<owner>/git-wt-clean/v0.1.0/git-wt-clean
-chmod +x ~/.local/bin/git-wt-clean
+curl -fsSLo ~/.local/bin/git-worktree-clean https://raw.githubusercontent.com/<owner>/git-worktree-clean/v0.1.0/git-worktree-clean
+chmod +x ~/.local/bin/git-worktree-clean
 ```
 
 Read it before running it; it is one file. Because the name starts with `git-`, it also
-runs as `git wt-clean`.
+runs as `git worktree-clean`.
 
 ## Usage
 
 ```
-git-wt-clean status [options] [PATH...]
-git-wt-clean remove [options] [PATH...]
+git-worktree-clean status [options] [PATH...]
+git-worktree-clean remove [options] [PATH...]
 ```
 
 `PATH` is a repository, or a folder whose direct children are repositories. With no

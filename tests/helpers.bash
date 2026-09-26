@@ -2,7 +2,7 @@
 # run against the fake gh in tests/bin), a clone of it under $ROOT, and helpers to
 # create worktrees in every state the tool must recognise.
 
-BIN="${WT_BIN:-$BATS_TEST_DIRNAME/../git-wt-clean}"
+BIN="${WT_BIN:-$BATS_TEST_DIRNAME/../git-worktree-clean}"
 
 setup() {
   T="$BATS_TEST_TMPDIR"
