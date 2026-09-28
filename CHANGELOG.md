@@ -15,3 +15,5 @@ First release.
 - Progress lines, sizes, space that can be freed and space actually freed.
 - `--json`, `--no-fetch`, `--no-forge`, `--delete-branches`, `--disposable`.
 - NUL-separated parsing, so paths with spaces and newlines are safe.
+- `install.sh` for macOS and Linux: dependency check with per-OS install hints, link or
+  copy into `~/.local/bin` (or `--prefix`), PATH guidance per shell, `--uninstall`.

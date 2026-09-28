@@ -7,6 +7,6 @@ test-bash32:
 	WT_BASH=/bin/bash bats tests/
 
 lint:
-	shellcheck -s bash git-worktree-clean tests/bin/gh
+	shellcheck -s bash git-worktree-clean install.sh tests/bin/gh
 
 check: lint test
