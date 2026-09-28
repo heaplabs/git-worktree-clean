@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # git-worktree-clean — find git worktrees whose work is finished, and remove them safely.
-# https://github.com/<owner>/git-worktree-clean · MIT license
+# https://github.com/heaplabs/git-worktree-clean · MIT license
 #
 # Runs on bash 3.2 (macOS) and later. Needs git >= 2.36; jq and gh are optional.
 

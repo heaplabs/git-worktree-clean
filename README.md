@@ -83,11 +83,11 @@ Optional: [`gh`](https://cli.github.com/) (logged in) and `jq` for pull-request 
 and `jq` for `--json`.
 
 ```bash
-curl -fsSLo ~/.local/bin/git-worktree-clean https://raw.githubusercontent.com/<owner>/git-worktree-clean/v0.1.0/git-worktree-clean
-chmod +x ~/.local/bin/git-worktree-clean
+git clone git@github.com:heaplabs/git-worktree-clean.git ~/src/git-worktree-clean
+ln -s ~/src/git-worktree-clean/git-worktree-clean ~/.local/bin/git-worktree-clean
 ```
 
-Read it before running it; it is one file. Because the name starts with `git-`, it also
+`git pull` in the clone updates it. It is one file; read it before running it. Because the name starts with `git-`, it also
 runs as `git worktree-clean`.
 
 ## Usage
