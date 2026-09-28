@@ -1,0 +1,9 @@
+# Every change is requested from repo-owners for review; branch protection on main
+# requires one approval. The tool deletes folders, so its safety checks, their tests
+# and the release path always get a second pair of eyes.
+
+*                               @heaplabs/repo-owners
+
+# The enforcement itself.
+/.github/CODEOWNERS             @heaplabs/repo-owners
+/.github/workflows/             @heaplabs/repo-owners
