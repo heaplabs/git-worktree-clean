@@ -78,17 +78,35 @@ own refusal (for example, a worktree with submodules) is a second line of defenc
 
 ## Install
 
-Needs bash (3.2 or later, so the macOS default works), git 2.36 or later, and `df`/`du`.
-Optional: [`gh`](https://cli.github.com/) (logged in) and `jq` for pull-request checks,
-and `jq` for `--json`.
+Works on macOS and Linux. Needs bash (3.2 or later, so the macOS default works) and
+git 2.36 or later. Optional: [`gh`](https://cli.github.com/), logged in, plus `jq` for
+pull-request checks; `jq` for `--json`.
 
 ```bash
-git clone git@github.com:heaplabs/git-worktree-clean.git ~/src/git-worktree-clean
-ln -s ~/src/git-worktree-clean/git-worktree-clean ~/.local/bin/git-worktree-clean
+gh repo clone heaplabs/git-worktree-clean ~/.local/share/git-worktree-clean
+~/.local/share/git-worktree-clean/install.sh
 ```
 
-`git pull` in the clone updates it. It is one file; read it before running it. Because the name starts with `git-`, it also
-runs as `git worktree-clean`.
+The installer checks the dependencies and prints the install command for anything
+missing (`brew` on macOS; `apt-get`, `dnf`, `pacman`, `apk` or `zypper` on Linux). It then
+links the script into `~/.local/bin` and, if that folder is not on your `PATH`, prints the
+line to add to your shell's startup file. It never uses `sudo`. Because the name starts
+with `git-`, the tool also runs as `git worktree-clean`.
+
+| Command | Effect |
+|---|---|
+| `install.sh` | link into `~/.local/bin` |
+| `install.sh --prefix DIR` | install into another folder you can write to |
+| `install.sh --copy` | copy instead of link, for a clone you will delete |
+| `install.sh --uninstall` | remove what the installer put there |
+| `install.sh --force` | replace a `git-worktree-clean` it did not install |
+
+**Update:** `git -C ~/.local/share/git-worktree-clean pull`. A linked install picks up the
+change at once; after `--copy`, run the installer again.
+
+**Uninstall:** `~/.local/share/git-worktree-clean/install.sh --uninstall`, then delete the
+clone. The installer removes only a link to its own clone or a copy of the tool; anything
+else at that path is left alone.
 
 ## Usage
 
@@ -142,7 +160,7 @@ once per repository, so a folder of dozens of repositories scans in seconds.
 ```bash
 make test          # bats suite; builds real repos in temp folders, fake gh in tests/bin
 make test-bash32   # the same suite under /bin/bash (macOS)
-make lint          # shellcheck
+make lint          # shellcheck on the tool, the installer and the fake gh
 ```
 
 Each safety check has a test that fails when the check is removed; keep it that way
