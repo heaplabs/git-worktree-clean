@@ -166,6 +166,13 @@ make lint          # shellcheck on the tool, the installer and the fake gh
 Each safety check has a test that fails when the check is removed; keep it that way
 when adding one.
 
+## Contributing
+
+`main` is protected: changes go through a pull request with one approving review, all
+three CI jobs green (Ubuntu, macOS bash 5, macOS bash 3.2) and every review thread
+resolved. Review requests go to `@heaplabs/repo-owners` (see `.github/CODEOWNERS`).
+Release tags (`v*`) can only be created by repo-owners, and cannot be moved or deleted.
+
 ## License
 
 MIT

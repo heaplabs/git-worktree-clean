@@ -1,0 +1,16 @@
+# The tool has no package dependencies; the only third-party code is GitHub Actions.
+# One grouped PR a week keeps the pinned action versions current.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions:
+        patterns: ["*"]
