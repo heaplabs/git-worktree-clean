@@ -24,8 +24,11 @@ Options:
   --delete-branches    after removing a worktree, delete its local branch too
   --no-fetch           do not fetch; compare against the remote-tracking refs you have
   --no-forge           do not ask GitHub about pull requests (plain git only)
-  --disposable LIST    comma-separated ignored names that may be deleted
-                       (default: node_modules,target,dist,build,... see README)
+  --add-disposable LIST
+                       more comma-separated ignored names that may be deleted, on top of
+                       the defaults (or set them once: git config --global --add
+                       worktree-clean.disposable ".env.local,logs")
+  --disposable LIST    replace the default list of disposable ignored names
   --json               status only: one JSON object per worktree (needs jq)
   -h, --help           show this help
   --version            print the version
@@ -47,6 +50,7 @@ EOF
 
 CMD=""; YES=no; DELETE_BRANCHES=no; FETCH=yes; FORGE=yes; JSON=no
 DISPOSABLE="node_modules,target,dist,build,out,.next,.nuxt,.svelte-kit,.turbo,.cache,.parcel-cache,coverage,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,.venv,venv,.tox,.gradle,.bsp,.metals,.bloop,.idea,.DS_Store,*.pyc,*.class"
+EXTRA_DISPOSABLE=""
 ROOTS=()
 
 die() { printf 'git-worktree-clean: %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -63,6 +67,8 @@ while [ $# -gt 0 ]; do
     --json) JSON=yes ;;
     --disposable) [ $# -ge 2 ] || die "--disposable needs a value"; DISPOSABLE="$2"; shift ;;
     --disposable=*) DISPOSABLE="${1#--disposable=}" ;;
+    --add-disposable) [ $# -ge 2 ] || die "--add-disposable needs a value"; EXTRA_DISPOSABLE+=",$2"; shift ;;
+    --add-disposable=*) EXTRA_DISPOSABLE+=",${1#--add-disposable=}" ;;
     --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done; break ;;
     -*) die "unknown option: $1 (see --help)" ;;
     *) ROOTS+=("$1") ;;
@@ -141,16 +147,21 @@ display_path() {
 # ---------------------------------------------------------------- discovery
 
 # Repositories, one entry per git common dir.
-R_PATH=(); R_COMMON=(); R_REMOTE=(); R_TARGET=(); R_FETCH=(); R_SLUG=(); R_PRS=()
+R_PATH=(); R_COMMON=(); R_REMOTE=(); R_TARGET=(); R_FETCH=(); R_SLUG=(); R_PRS=(); R_DISP=()
 # Linked worktrees.
 W_REPO=(); W_PATH=(); W_BRANCH=(); W_LOCKED=()
 ROOT_DIRS=()
 
 add_repo() {
-  local dir="$1" common i
+  local dir="$1" common main i
   common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
   for (( i = 0; i < ${#R_COMMON[@]}; i++ )); do [ "${R_COMMON[$i]}" = "$common" ] && return 0; done
-  R_PATH+=("$dir"); R_COMMON+=("$common")
+  # Run every later git command from the main worktree (the first one git lists). A linked
+  # worktree found first while scanning could be removed mid-run, stranding the rest.
+  IFS= read -r -d '' main < <(git -C "$dir" worktree list --porcelain -z 2>/dev/null) || true
+  main=${main#worktree }
+  [ -n "$main" ] && [ -d "$main" ] || main=$dir
+  R_PATH+=("$main"); R_COMMON+=("$common"); R_DISP+=("")
 }
 
 discover_repos() {
@@ -232,6 +243,7 @@ prepare_repos() {
     nwt=$(( ${#W_PATH[@]} - before ))
     R_REMOTE[i]=""; R_TARGET[i]=""; R_FETCH[i]=skipped; R_SLUG[i]=""; R_PRS[i]=""
     [ "$nwt" -gt 0 ] || continue                  # only repos with linked worktrees cost anything
+    R_DISP[i]=$(git -C "$repo" config --get-all worktree-clean.disposable 2>/dev/null | paste -sd, -)
     remote=$(pick_remote "$repo")
     R_REMOTE[i]=$remote
     if [ -n "$remote" ] && [ "$FETCH" = yes ]; then
@@ -272,15 +284,15 @@ collect_cwds() {
 
 # ---------------------------------------------------------------- evaluation
 
-is_disposable() {  # is_disposable PATH: true if the path, or any folder above it, is disposable
-  local path="${1%/}" part pat IFS rc=1
+is_disposable() {  # is_disposable PATH LIST: true if the path, or a folder above it, matches LIST
+  local path="${1%/}" list="$2" part pat IFS rc=1
   set -f                                   # patterns like *.pyc must not glob against files
   IFS=/
   # shellcheck disable=SC2086  # split on / on purpose
   set -- $path
   IFS=,
   for part in "$@"; do
-    for pat in $DISPOSABLE; do
+    for pat in $list; do
       # shellcheck disable=SC2254
       case "$part" in $pat) rc=0; break 2 ;; esac
     done
@@ -295,10 +307,11 @@ landed_in() {
   head=$(git -C "$wt" rev-parse HEAD) || return 1
   if git -C "$wt" merge-base --is-ancestor "$head" "$target" 2>/dev/null; then echo "merged"; return 0; fi
   mb=$(git -C "$wt" merge-base "$head" "$target" 2>/dev/null) || return 1
-  if [ -z "$(git -C "$wt" diff --name-only "$mb" "$head")" ]; then echo "no changes of its own"; return 0; fi
-  # Every file this branch touched is identical in the target: nothing here is missing there.
-  if git -C "$wt" diff --name-only -z "$mb" "$head" |
-       xargs -0 git -C "$wt" diff --quiet "$head" "$target" -- 2>/dev/null; then
+  if [ -z "$(git -C "$wt" diff --no-renames --name-only "$mb" "$head")" ]; then echo "no changes of its own"; return 0; fi
+  # Every path this branch touched is identical in the target: nothing here is missing there.
+  # --no-renames: a rename is a delete plus an add, and both paths must match.
+  if git -C "$wt" diff --no-renames --name-only -z "$mb" "$head" |
+       xargs -0 git -C "$wt" diff --no-renames --quiet "$head" "$target" -- 2>/dev/null; then
     echo "content already in target"; return 0
   fi
   # Squash merge: the branch's combined diff equals one commit on the target.
@@ -334,11 +347,14 @@ evaluate() {
   ri=${W_REPO[$wi]}; wt=${W_PATH[$wi]}; br=${W_BRANCH[$wi]}; target=${R_TARGET[$ri]}
   CHANGES="-"; UNPUSHED="-"; PR="-"; AGE="-"; SIZE_KB=""
 
+  # Locked first: a locked worktree on an unplugged drive has no folder, and git will
+  # not prune it anyway.
+  if [ -n "${W_LOCKED[$wi]}" ]; then
+    V=KEEP; WHY="locked"; [ -d "$wt" ] || WHY="locked, folder not present (unmounted drive?)"; return
+  fi
   if [ ! -d "$wt" ]; then V=PRUNE; WHY="folder is gone"; return; fi
   head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || { V=REVIEW; WHY="not a readable git worktree"; return; }
   AGE=$(( ( $(now) - $(git -C "$wt" log -1 --format=%ct 2>/dev/null || now) ) / 86400 ))
-
-  if [ -n "${W_LOCKED[$wi]}" ]; then V=KEEP; WHY="locked"; return; fi
 
   real=$(cd "$wt" 2>/dev/null && pwd -P) || real=$wt
   open=$(awk -F'\t' -v w="$real" '$1 == w || index($1, w "/") == 1 { print $2 }' <<<"$CWDS" | sort -u | paste -sd, -)
@@ -350,7 +366,7 @@ evaluate() {
     xy=${entry:0:2}; f=${entry:3}
     case "$xy" in
       R*|C*) skip=yes; n_changes=$((n_changes + 1)) ;;
-      '!!') is_disposable "$f" || kept_ignored+="${kept_ignored:+, }${f%/}" ;;
+      '!!') is_disposable "$f" "$DISPOSABLE$EXTRA_DISPOSABLE,${R_DISP[$ri]}" || kept_ignored+="${kept_ignored:+, }${f%/}" ;;
       *) n_changes=$((n_changes + 1)) ;;
     esac
   done < <(git -C "$wt" status --porcelain=v1 -z --ignored 2>/dev/null)
@@ -397,7 +413,6 @@ evaluate() {
 
 START=$(now)
 discover_repos
-collect_cwds
 [ ${#R_PATH[@]} -gt 0 ] || die "no git repositories found under: ${ROOTS[*]}" 0
 FREE0=$(disk_free_kb "${ROOT_DIRS[0]}"); TOTAL=$(disk_total_kb "${ROOT_DIRS[0]}")
 
@@ -408,6 +423,7 @@ if [ "$JSON" = no ]; then
 fi
 
 prepare_repos
+collect_cwds
 N=${#W_PATH[@]}
 if [ "$N" -eq 0 ]; then [ "$JSON" = yes ] || echo "No linked worktrees found."; exit 0; fi
 
@@ -495,6 +511,7 @@ for i in "${PLAN[@]}"; do
   step=$((step + 1)); tag="[$step/$total_steps]"
   wt=${W_PATH[$i]}; ri=${W_REPO[$i]}; repo=${R_PATH[$ri]}; br=${W_BRANCH[$i]}
   progress "$tag re-checking $(display_path "$wt")…"
+  CWDS=""; collect_cwds                                    # a shell may have opened since the scan
   FRESH=yes evaluate "$i"                                  # state may have changed since the plan
   if [ "$V" != "${E_V[$i]}" ]; then
     say "$tag ${C_REVIEW}SKIP${C_0}    $(display_path "$wt") — now $V: $WHY"; skipped=$((skipped + 1)); continue

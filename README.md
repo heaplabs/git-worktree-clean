@@ -66,6 +66,9 @@ own refusal (for example, a worktree with submodules) is a second line of defenc
 
 ### What it does not check
 
+- **Resources outside the folder.** Removing a worktree deletes its folder only. A
+  database, container or port a project created for that worktree is left behind.
+
 - **Open files in an editor.** It sees processes whose *current folder* is inside the
   worktree, not an editor that merely has a file open. Save your work first.
 - **Stashes** are shared by all worktrees of a repository, so removing a worktree does
@@ -83,7 +86,7 @@ git 2.36 or later. Optional: [`gh`](https://cli.github.com/), logged in, plus `j
 pull-request checks; `jq` for `--json`.
 
 ```bash
-gh repo clone heaplabs/git-worktree-clean ~/.local/share/git-worktree-clean
+git clone https://github.com/heaplabs/git-worktree-clean.git ~/.local/share/git-worktree-clean
 ~/.local/share/git-worktree-clean/install.sh
 ```
 
@@ -126,7 +129,8 @@ are listed too.
 | `--delete-branches` | also delete the local branch of each removed worktree |
 | `--no-fetch` | skip fetching; compare against the remote-tracking refs you already have |
 | `--no-forge` | skip GitHub pull-request lookups |
-| `--disposable LIST` | replace the list of ignored names that may be deleted |
+| `--add-disposable LIST` | more ignored names that may be deleted, on top of the defaults |
+| `--disposable LIST` | replace the default list of ignored names that may be deleted |
 | `--json` | `status` only: one JSON object per worktree |
 
 Default disposable names: `node_modules target dist build out .next .nuxt .svelte-kit
@@ -134,8 +138,23 @@ Default disposable names: `node_modules target dist build out .next .nuxt .svelt
 .venv venv .tox .gradle .bsp .metals .bloop .idea .DS_Store *.pyc *.class`. A name
 matches the file or any folder above it.
 
+Most projects have a few more files that are safe to lose: local env files for tests,
+log and report folders. Save them once in git config instead of passing a flag each time.
+Values are comma-separated, can be set more than once, and are added to the defaults:
+
+```bash
+git config --global --add worktree-clean.disposable ".env.test.local,logs,reports,.tmp"
+git -C ~/code/app config --add worktree-clean.disposable "junit.xml"   # one repository only
+```
+
+Only list files you would never miss: anything matching is deleted with the worktree.
+
 Exit codes: `0` success or nothing to do, `1` a removal failed or was aborted,
 `2` bad usage, `3` missing dependency.
+
+The UNPUSHED column counts commits that are on no remote branch. After a squash merge the
+remote branch is usually deleted, so a merged worktree can show a large number here; the
+REASON column says why it is still safe.
 
 Colour follows [`NO_COLOR`](https://no-color.org/); progress lines appear only on a terminal.
 
