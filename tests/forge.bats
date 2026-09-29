@@ -34,7 +34,7 @@ diverged_squash() {
   echo after >>"$ROOT/feat/feat.txt"; git -C "$ROOT/feat" commit -qam "after merge"
   fake_prs "[{\"number\":7,\"headRefName\":\"feat\",\"headRefOid\":\"$merged_at\",\"state\":\"MERGED\",\"isCrossRepository\":false}]"
   [ "$(verdict_of feat)" = KEEP ]
-  [[ "$(reason_of feat)" == *"made after PR #7"* ]]
+  [[ "$(reason_of feat)" == *"made after PR #7"* ]] || false
 }
 
 @test "a fork's merged PR with the same branch name is ignored" {

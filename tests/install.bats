@@ -16,7 +16,7 @@ run_install() { "${WT_BASH:-bash}" "$INSTALL" "$@"; }
   [ -L "$P/git-worktree-clean" ]
   [ "$(cd "$P" && cd "$(dirname "$(readlink git-worktree-clean)")" && pwd -P)/git-worktree-clean" = "$SCRIPT" ]
   "$P/git-worktree-clean" --version | grep -q '^git-worktree-clean '
-  [[ "$output" == *"Installed git-worktree-clean"* ]]
+  [[ "$output" == *"Installed git-worktree-clean"* ]] || false
 }
 
 @test "--copy installs a regular file" {
@@ -37,7 +37,7 @@ run_install() { "${WT_BASH:-bash}" "$INSTALL" "$@"; }
   mkdir -p "$P"; echo 'echo mine' >"$P/git-worktree-clean"
   run run_install --prefix "$P"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"was not installed by this script"* ]]
+  [[ "$output" == *"was not installed by this script"* ]] || false
   [ "$(cat "$P/git-worktree-clean")" = "echo mine" ]
 }
 
@@ -50,15 +50,15 @@ run_install() { "${WT_BASH:-bash}" "$INSTALL" "$@"; }
 
 @test "prints a PATH line for the user's shell when the prefix is not on PATH" {
   run run_install --prefix "$P"
-  [[ "$output" == *"is not on your PATH"* ]]
-  [[ "$output" == *"~/.zshrc"* ]]
-  [[ "$output" == *"export PATH=\"$P:\$PATH\""* ]]
+  [[ "$output" == *"is not on your PATH"* ]] || false
+  [[ "$output" == *"~/.zshrc"* ]] || false
+  [[ "$output" == *"export PATH=\"$P:\$PATH\""* ]] || false
 }
 
 @test "no PATH hint when the prefix is already on PATH" {
   PATH="$P:$PATH" run run_install --prefix "$P"
-  [[ "$output" != *"is not on your PATH"* ]]
-  [[ "$output" == *"Try it"* ]]
+  [[ "$output" != *"is not on your PATH"* ]] || false
+  [[ "$output" == *"Try it"* ]] || false
 }
 
 @test "--uninstall removes its own install" {
@@ -78,7 +78,7 @@ run_install() { "${WT_BASH:-bash}" "$INSTALL" "$@"; }
 @test "--uninstall with nothing installed succeeds" {
   run run_install --prefix "$P" --uninstall
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Nothing installed"* ]]
+  [[ "$output" == *"Nothing installed"* ]] || false
 }
 
 @test "unwritable prefix fails with a clear message" {
@@ -87,7 +87,7 @@ run_install() { "${WT_BASH:-bash}" "$INSTALL" "$@"; }
   run run_install --prefix "$P"
   chmod 755 "$P"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not writable"* ]]
+  [[ "$output" == *"not writable"* ]] || false
 }
 
 @test "unknown option is a usage error" {

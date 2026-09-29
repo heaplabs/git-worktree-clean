@@ -2,6 +2,10 @@
 # Fake gh for tests. Serves pull requests from $FAKE_GH_PRS (a JSON array).
 #   FAKE_GH_FAIL=1          every call fails
 #   FAKE_GH_FRESH=<file>    `pr list --head` (the re-check before removal) reads this file instead
+#   FAKE_GH_SPAWN_<branch>=<dir>
+#                           on the first `pr list --head <branch>`, start a process whose cwd is
+#                           <dir> and record its pid in $FAKE_GH_SPAWN_PIDFILE: a shell that
+#                           appears after the plan was made
 set -euo pipefail
 [ "${FAKE_GH_FAIL:-0}" = 1 ] && { echo "gh: simulated failure" >&2; exit 1; }
 
@@ -18,5 +22,13 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-if [ -n "$head" ]; then jq --arg h "$head" '[.[] | select(.headRefName == $h)]' "$file"
+if [ -n "$head" ]; then
+  var="FAKE_GH_SPAWN_$head"
+  dir="${!var:-}"
+  if [ -n "$dir" ] && [ -d "$dir" ] && [ ! -s "${FAKE_GH_SPAWN_PIDFILE:-/dev/null}" ]; then
+    ( cd "$dir" && exec sleep 60 ) </dev/null >/dev/null 2>&1 &
+    echo $! >"$FAKE_GH_SPAWN_PIDFILE"
+    sleep 0.5
+  fi
+  jq --arg h "$head" '[.[] | select(.headRefName == $h)]' "$file"
 else cat "$file"; fi
