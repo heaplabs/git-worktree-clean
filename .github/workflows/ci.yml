@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.os }} / ${{ matrix.bash }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install tools (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bats jq shellcheck
