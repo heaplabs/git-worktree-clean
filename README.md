@@ -57,6 +57,7 @@ git worktree-clean status ~/code   # a folder of repositories instead of the cur
 |---|---|
 | `--yes` | remove without asking |
 | `--delete-branches` | also delete each removed worktree's local branch |
+| `--discard` | also offer worktrees kept only by leftover files, one at a time (see below) |
 | `--no-fetch` | don't fetch first (faster, uses what you last fetched) |
 | `--add-disposable LIST` | more ignored files that may be deleted (see below) |
 | `--json` | machine-readable `status` |
@@ -76,6 +77,28 @@ them once:
 ```bash
 git config --global --add worktree-clean.disposable ".env.test.local,logs,reports"
 ```
+
+## Worktrees with leftover files
+
+A worktree with a stray notes file or a leftover `.env` is kept, even when its work is
+long finished. `remove --discard` offers those one at a time, when nothing else holds them
+back: no open pull request, nobody working in them, and nothing committed that removal
+would lose.
+
+```
+[1/1] DISCARD? api-wt-spike  1.2M
+    try/queue · PR none · last commit 12d ago · files last changed 9d ago
+    1 change(s), saved to the stash first:
+      ?? notes.md
+    1 ignored file(s) or folder(s), deleted with no copy:
+      !! .env
+    kept: branch try/queue
+Discard these and remove the worktree? [y/N/q]
+```
+
+Changes are saved with `git stash` before the worktree goes (`git stash list` gets them
+back); ignored files are not. `--yes` never answers this question, and without a terminal
+nothing is offered.
 
 The full rules, the default list and the known limits are in
 [docs/how-it-works.md](docs/how-it-works.md).

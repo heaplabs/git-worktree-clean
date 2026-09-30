@@ -17,6 +17,11 @@ First release.
 - NUL-separated parsing, so paths with spaces and newlines are safe.
 - `--add-disposable` and the `worktree-clean.disposable` git config setting extend the
   disposable list instead of replacing it.
+- `remove --discard` offers, one at a time, worktrees kept only by local files (no open
+  PR, nothing committed lost). It shows every file that would go, stashes tracked and
+  untracked changes first, re-checks after the answer, and is never answered by `--yes`.
+  `status` marks those rows `[--discard]` and `--json` adds `discardable`.
+- The PR and UNPUSHED columns are now filled in for worktrees with uncommitted changes too.
 - `install.sh` for macOS and Linux: dependency check with per-OS install hints, link or
   copy into `~/.local/bin` (or `--prefix`), PATH guidance per shell, `--uninstall`.
 
