@@ -22,6 +22,10 @@ Default: the repository you are in, otherwise the children of the current folder
 Options:
   --yes, -y            remove without asking
   --delete-branches    after removing a worktree, delete its local branch too
+  --discard            remove only: also offer, one at a time, worktrees that are kept only
+                       by local files (uncommitted changes, ignored files) and have no open
+                       pull request. Changes are stashed first; ignored files are lost.
+                       Always asks, even with --yes, and needs a terminal
   --no-fetch           do not fetch; compare against the remote-tracking refs you have
   --no-forge           do not ask GitHub about pull requests (plain git only)
   --add-disposable LIST
@@ -41,6 +45,8 @@ Verdicts (first match wins):
           or its pull request was merged or closed at exactly this commit
   REVIEW  none of the above could be proven; never removed automatically
 
+  remove --discard also offers the KEEP rows that nothing but local files holds back.
+
 Exit codes: 0 success or nothing to do, 1 a removal failed or was aborted,
             2 bad usage, 3 missing dependency.
 EOF
@@ -48,7 +54,7 @@ EOF
 
 # ---------------------------------------------------------------- options
 
-CMD=""; YES=no; DELETE_BRANCHES=no; FETCH=yes; FORGE=yes; JSON=no
+CMD=""; YES=no; DELETE_BRANCHES=no; FETCH=yes; FORGE=yes; JSON=no; DISCARD=no
 DISPOSABLE="node_modules,target,dist,build,out,.next,.nuxt,.svelte-kit,.turbo,.cache,.parcel-cache,coverage,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,.venv,venv,.tox,.gradle,.bsp,.metals,.bloop,.idea,.DS_Store,*.pyc,*.class"
 EXTRA_DISPOSABLE=""
 ROOTS=()
@@ -62,6 +68,7 @@ while [ $# -gt 0 ]; do
     --version|version) echo "git-worktree-clean $VERSION"; exit 0 ;;
     -y|--yes) YES=yes ;;
     --delete-branches) DELETE_BRANCHES=yes ;;
+    --discard) DISCARD=yes ;;
     --no-fetch) FETCH=no ;;
     --no-forge) FORGE=no ;;
     --json) JSON=yes ;;
@@ -77,6 +84,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$CMD" ] || { usage >&2; exit 2; }
 [ "$JSON" = yes ] && [ "$CMD" != status ] && die "--json works with status only"
+[ "$DISCARD" = yes ] && [ "$CMD" != remove ] && die "--discard works with remove only"
 
 # ---------------------------------------------------------------- dependencies
 
@@ -112,6 +120,24 @@ else
 fi
 TTY_ERR=no; [ -t 2 ] && TTY_ERR=yes
 
+# Answers are read from the terminal, not stdin, so a pipe can never say yes.
+# GIT_WORKTREE_CLEAN_TTY replaces /dev/tty; the tests feed their answers through it.
+TTY_IN=${GIT_WORKTREE_CLEAN_TTY:-/dev/tty}
+TTY_STATE=""
+open_tty() {  # opens fd 9 once; false when there is no terminal to ask
+  if [ -z "$TTY_STATE" ]; then
+    if { exec 9<"$TTY_IN"; } 2>/dev/null; then TTY_STATE=yes; else TTY_STATE=no; fi
+  fi
+  [ "$TTY_STATE" = yes ]
+}
+ask() {  # ask PROMPT: prints it and leaves the answer in ANS; false without a terminal
+  ANS=""
+  printf '%s' "$1"
+  open_tty || return 1
+  IFS= read -r ANS <&9 || ANS=""
+  return 0
+}
+
 # A transient status line on stderr: redrawn in a terminal, silent otherwise.
 progress()      { [ "$TTY_ERR" = yes ] && printf '\r\033[K%s%s%s' "$C_DIM" "$*" "$C_0" >&2; return 0; }
 progress_done() { [ "$TTY_ERR" = yes ] && printf '\r\033[K' >&2; return 0; }
@@ -120,7 +146,7 @@ say()           { progress_done; printf '%s\n' "$*"; }
 color() {
   case "$1" in
     KEEP) printf '%s' "$C_KEEP" ;; REVIEW) printf '%s' "$C_REVIEW" ;;
-    REMOVE) printf '%s' "$C_REMOVE" ;; PRUNE) printf '%s' "$C_PRUNE" ;;
+    REMOVE|DISCARD) printf '%s' "$C_REMOVE" ;; PRUNE) printf '%s' "$C_PRUNE" ;;
   esac
 }
 human() {  # kilobytes -> 1.2G / 340M / 12K
@@ -133,6 +159,13 @@ fit() {  # fit TEXT WIDTH: keep the end of long text, which is the informative p
   if [ "${#s}" -gt "$w" ]; then printf '…%s' "${s:$(( ${#s} - w + 1 ))}"; else printf '%s' "$s"; fi
 }
 now() { date +%s; }
+ago() {  # seconds -> 45m / 7h / 3d
+  if [ "$1" -lt 3600 ]; then printf '%dm' $(( $1 / 60 ))
+  elif [ "$1" -lt 86400 ]; then printf '%dh' $(( $1 / 3600 ))
+  else printf '%dd' $(( $1 / 86400 )); fi
+}
+# Modification times as epoch seconds: GNU stat, else BSD stat (macOS).
+if stat -c %Y / >/dev/null 2>&1; then STAT_MTIME=(stat -c %Y); else STAT_MTIME=(stat -f %m); fi
 disk_free_kb()  { df -Pk "$1" | awk 'NR == 2 { print $4 }'; }
 disk_total_kb() { df -Pk "$1" | awk 'NR == 2 { print $2 }'; }
 display_path() {
@@ -340,12 +373,16 @@ pr_for_branch() {  # pr_for_branch REPO_INDEX BRANCH: JSON of the newest same-re
   jq -c --arg b "$br" '[.[] | select(.headRefName == $b and (.isCrossRepository | not))][0] // empty' <<<"$json"
 }
 
-# Sets V, WHY, CHANGES, UNPUSHED, PR, AGE, SIZE_KB for worktree index $1.
+# Sets V, WHY, CHANGES, UNPUSHED, PR, AGE, SIZE_KB for worktree index $1, and for rows held
+# back only by local files: DISCARDABLE (yes/no), D_NOT (why not), D_SHOW (the files, one
+# "XY path" line each), D_KEPT_N (ignored ones), D_NEWEST and D_FP (with --discard).
 evaluate() {
   local wi="$1" ri wt br real open entry xy f skip=no n_changes=0 kept_ignored="" target how head
-  local prj prstate prhead prnum
+  local prj="" prstate="" prhead="" prnum="" local_block="" mtimes
+  local dpaths=()
   ri=${W_REPO[$wi]}; wt=${W_PATH[$wi]}; br=${W_BRANCH[$wi]}; target=${R_TARGET[$ri]}
   CHANGES="-"; UNPUSHED="-"; PR="-"; AGE="-"; SIZE_KB=""
+  DISCARDABLE=no; D_NOT=""; D_SHOW=""; D_KEPT_N=0; D_NEWEST=""; D_FP=""
 
   # Locked first: a locked worktree on an unplugged drive has no folder, and git will
   # not prune it anyway.
@@ -365,14 +402,19 @@ evaluate() {
     if [ "$skip" = yes ]; then skip=no; continue; fi           # the old name of a rename
     xy=${entry:0:2}; f=${entry:3}
     case "$xy" in
-      R*|C*) skip=yes; n_changes=$((n_changes + 1)) ;;
-      '!!') is_disposable "$f" "$DISPOSABLE$EXTRA_DISPOSABLE,${R_DISP[$ri]}" || kept_ignored+="${kept_ignored:+, }${f%/}" ;;
-      *) n_changes=$((n_changes + 1)) ;;
+      R*|C*) skip=yes; n_changes=$((n_changes + 1)); D_SHOW+="$xy $f"$'\n'; dpaths+=("$f") ;;
+      '!!') if ! is_disposable "$f" "$DISPOSABLE$EXTRA_DISPOSABLE,${R_DISP[$ri]}"; then
+              kept_ignored+="${kept_ignored:+, }${f%/}"; D_KEPT_N=$((D_KEPT_N + 1))
+              D_SHOW+="$xy $f"$'\n'; dpaths+=("$f")
+            fi ;;
+      *) n_changes=$((n_changes + 1)); D_SHOW+="$xy $f"$'\n'; dpaths+=("$f") ;;
     esac
   done < <(git -C "$wt" status --porcelain=v1 -z --ignored 2>/dev/null)
   CHANGES=$n_changes
-  if [ "$n_changes" -gt 0 ]; then V=KEEP; WHY="$n_changes uncommitted change(s)"; return; fi
-  if [ -n "$kept_ignored" ]; then V=KEEP; WHY="ignored files would be lost: $(fit "$kept_ignored" 60)"; return; fi
+  # Local files hold it back whatever else is true, but the checks below still run: they
+  # fill the PR and UNPUSHED columns and decide whether --discard may offer it.
+  if [ "$n_changes" -gt 0 ]; then local_block="$n_changes uncommitted change(s)"
+  elif [ -n "$kept_ignored" ]; then local_block="ignored files would be lost: $(fit "$kept_ignored" 60)"; fi
 
   UNPUSHED=$(git -C "$wt" rev-list --count "$head" --not --remotes 2>/dev/null || echo "?")
 
@@ -385,7 +427,28 @@ evaluate() {
     else PR="none"
     fi
   fi
-  if [ "${prstate:-}" = OPEN ]; then V=KEEP; WHY="PR #$prnum is open"; return; fi
+
+  if [ -n "$local_block" ]; then
+    V=KEEP; WHY=$local_block
+    # --discard may offer it only if nothing committed can be lost and nobody is on it:
+    # no open PR, a PR lookup that worked, and commits either on a branch (which is kept)
+    # or, for a detached HEAD, already on a remote.
+    if [ "$prstate" = OPEN ]; then D_NOT="PR #$prnum is open"
+    elif [ "$PR" = "?" ]; then D_NOT="could not read pull requests"
+    elif [ -z "$br" ] && [ "$UNPUSHED" != 0 ]; then D_NOT="detached HEAD with $UNPUSHED commit(s) on no remote"
+    else
+      DISCARDABLE=yes
+      SIZE_KB=$(du -sk "$wt" 2>/dev/null | cut -f1)
+      if [ "$DISCARD" = yes ]; then
+        # When the files were last touched, and a fingerprint to notice a change later.
+        mtimes=$(cd "$wt" && printf '%s\0' "${dpaths[@]}" | xargs -0 "${STAT_MTIME[@]}" 2>/dev/null)
+        D_NEWEST=$(printf '%s\n' "$mtimes" | sort -n | tail -n 1)
+        D_FP=$(printf '%s\n%s\n' "$D_SHOW" "$mtimes" | cksum)
+      fi
+    fi
+    return
+  fi
+  if [ "$prstate" = OPEN ]; then V=KEEP; WHY="PR #$prnum is open"; return; fi
 
   if [ -n "$target" ] && how=$(landed_in "$wt" "$target"); then
     V=REMOVE; WHY="$how into ${target#refs/remotes/}"
@@ -427,8 +490,8 @@ collect_cwds
 N=${#W_PATH[@]}
 if [ "$N" -eq 0 ]; then [ "$JSON" = yes ] || echo "No linked worktrees found."; exit 0; fi
 
-E_V=(); E_WHY=(); E_SIZE=()
-n_keep=0; n_review=0; n_remove=0; n_prune=0; kb_remove=0; kb_review=0
+E_V=(); E_WHY=(); E_SIZE=(); E_DISC=()
+n_keep=0; n_review=0; n_remove=0; n_prune=0; kb_remove=0; kb_review=0; n_disc=0; kb_disc=0
 
 row() {  # VERDICT WORKTREE BRANCH CHANGES UNPUSHED PR AGE SIZE REASON
   printf '%s%-7s%s %-44s %-30s %7s %8s %-12s %4s %6s  %s\n' "$(color "$1")" "$1" "$C_0" \
@@ -437,18 +500,19 @@ row() {  # VERDICT WORKTREE BRANCH CHANGES UNPUSHED PR AGE SIZE REASON
 json_row() {
   jq -nc --arg verdict "$V" --arg reason "$WHY" --arg path "${W_PATH[$1]}" --arg branch "${W_BRANCH[$1]}" \
     --arg repo "${R_PATH[${W_REPO[$1]}]}" --arg changes "$CHANGES" --arg unpushed "$UNPUSHED" --arg pr "$PR" \
-    --arg age "$AGE" --arg size "${SIZE_KB:-}" \
+    --arg age "$AGE" --arg size "${SIZE_KB:-}" --arg discardable "$DISCARDABLE" \
     '{verdict: $verdict, reason: $reason, path: $path, branch: (if $branch == "" then null else $branch end),
       repo: $repo, changes: ($changes | tonumber? // null), unpushed: ($unpushed | tonumber? // null),
       pr: (if $pr == "-" then null else $pr end), age_days: ($age | tonumber? // null),
-      size_kb: ($size | tonumber? // null)}'
+      size_kb: ($size | tonumber? // null), discardable: ($discardable == "yes")}'
 }
 
 [ "$CMD" = status ] && [ "$JSON" = no ] && row VERDICT WORKTREE BRANCH CHANGES UNPUSHED PR AGE_D SIZE REASON
 for (( i = 0; i < N; i++ )); do
   progress "[$((i + 1))/$N] checking $(display_path "${W_PATH[$i]}")…"
   evaluate "$i"
-  E_V[i]=$V; E_WHY[i]=$WHY; E_SIZE[i]=${SIZE_KB:-}
+  E_V[i]=$V; E_WHY[i]=$WHY; E_SIZE[i]=${SIZE_KB:-}; E_DISC[i]=$DISCARDABLE
+  [ "$DISCARDABLE" = yes ] && { n_disc=$((n_disc + 1)); kb_disc=$((kb_disc + ${SIZE_KB:-0})); }
   case "$V" in
     KEEP) n_keep=$((n_keep + 1)) ;;
     REVIEW) n_review=$((n_review + 1)); kb_review=$((kb_review + ${SIZE_KB:-0})) ;;
@@ -460,7 +524,8 @@ for (( i = 0; i < N; i++ )); do
     if [ "$JSON" = yes ]; then json_row "$i"
     else
       size="-"; [ -n "${SIZE_KB:-}" ] && size=$(human "$SIZE_KB")
-      row "$V" "$(display_path "${W_PATH[$i]}")" "${W_BRANCH[$i]:-(detached)}" "$CHANGES" "$UNPUSHED" "$PR" "$AGE" "$size" "$WHY"
+      reason=$WHY; [ "$DISCARDABLE" = yes ] && reason+="  [--discard]"
+      row "$V" "$(display_path "${W_PATH[$i]}")" "${W_BRANCH[$i]:-(detached)}" "$CHANGES" "$UNPUSHED" "$PR" "$AGE" "$size" "$reason"
     fi
   fi
 done
@@ -473,6 +538,10 @@ summary() {
     "$C_REMOVE" "$n_remove" "$C_0" "$C_PRUNE" "$n_prune" "$C_0"
   printf '  can be freed: %s%s%s  ·  disk free: %s of %s  ·  %d worktrees in %ds\n' \
     "$C_B" "$(human "$kb_remove")" "$C_0" "$(human "$FREE0")" "$(human "$TOTAL")" "$N" "$(( $(now) - START ))"
+  if [ "$n_disc" -gt 0 ] && [ "$DISCARD" = no ]; then
+    printf '  kept only by local files: %d (%s) · %sgit-worktree-clean remove --discard%s asks about each one\n' \
+      "$n_disc" "$(human "$kb_disc")" "$C_B" "$C_0"
+  fi
   for w in ${WARNINGS[@]+"${WARNINGS[@]}"}; do printf '  %swarning: %s%s\n' "$C_REVIEW" "$w" "$C_0"; done
 }
 
@@ -485,29 +554,36 @@ fi
 
 # ---------------------------------------------------------------- remove
 
-PLAN=()
+PLAN=(); DPLAN=()
 for (( i = 0; i < N; i++ )); do
   case "${E_V[$i]}" in REMOVE|PRUNE) PLAN+=("$i") ;; esac
+  [ "$DISCARD" = yes ] && [ "${E_DISC[$i]}" = yes ] && DPLAN+=("$i")
 done
-if [ ${#PLAN[@]} -eq 0 ]; then echo "Nothing is safe to remove."; echo; summary; exit 0; fi
+if [ ${#PLAN[@]} -eq 0 ] && [ ${#DPLAN[@]} -eq 0 ]; then echo "Nothing is safe to remove."; echo; summary; exit 0; fi
 
-echo "Plan:"
-for i in "${PLAN[@]}"; do
-  size="-"; [ -n "${E_SIZE[$i]}" ] && size=$(human "${E_SIZE[$i]}")
-  printf '  %s%-7s%s %6s  %s  %s%s%s\n' "$(color "${E_V[$i]}")" "${E_V[$i]}" "$C_0" "$size" \
-    "$(display_path "${W_PATH[$i]}")" "$C_DIM" "${E_WHY[$i]}" "$C_0"
-done
+plan_row() {  # LABEL INDEX
+  local size="-"; [ -n "${E_SIZE[$2]}" ] && size=$(human "${E_SIZE[$2]}")
+  printf '  %s%-7s%s %6s  %s  %s%s%s\n' "$(color "$1")" "$1" "$C_0" "$size" \
+    "$(display_path "${W_PATH[$2]}")" "$C_DIM" "${E_WHY[$2]}" "$C_0"
+}
+if [ ${#PLAN[@]} -gt 0 ]; then
+  echo "Plan:"
+  for i in "${PLAN[@]}"; do plan_row "${E_V[$i]}" "$i"; done
+fi
+if [ ${#DPLAN[@]} -gt 0 ]; then
+  [ ${#PLAN[@]} -gt 0 ] && echo
+  echo "Kept only by local files; each one is shown and asked about separately (--discard):"
+  for i in "${DPLAN[@]}"; do plan_row DISCARD "$i"; done
+fi
 echo; summary; echo
 
-if [ "$YES" != yes ]; then
-  ans=""
-  printf 'Remove %d worktree(s) (%s) and prune %d? [y/N] ' "$n_remove" "$(human "$kb_remove")" "$n_prune"
-  { read -r ans </dev/tty; } 2>/dev/null || true      # no terminal: empty answer, so abort
-  case "$ans" in y|Y|yes) echo ;; *) echo; echo "Aborted. Nothing changed."; exit 1 ;; esac
+if [ ${#PLAN[@]} -gt 0 ] && [ "$YES" != yes ]; then
+  ask "$(printf 'Remove %d worktree(s) (%s) and prune %d? [y/N] ' "$n_remove" "$(human "$kb_remove")" "$n_prune")" || true
+  case "$ANS" in y|Y|yes) echo ;; *) echo; echo "Aborted. Nothing changed."; exit 1 ;; esac   # no terminal: abort
 fi
 
-done_n=0; failed=0; skipped=0; kb_freed=0; step=0; total_steps=${#PLAN[@]}
-for i in "${PLAN[@]}"; do
+done_n=0; failed=0; skipped=0; kb_freed=0; step=0; total_steps=${#PLAN[@]}; discarded=0; declined=0
+for i in ${PLAN[@]+"${PLAN[@]}"}; do
   step=$((step + 1)); tag="[$step/$total_steps]"
   wt=${W_PATH[$i]}; ri=${W_REPO[$i]}; repo=${R_PATH[$ri]}; br=${W_BRANCH[$i]}
   progress "$tag re-checking $(display_path "$wt")…"
@@ -541,10 +617,104 @@ for i in "${PLAN[@]}"; do
 done
 progress_done
 
+# ---------------------------------------------------------------- remove --discard
+
+# What discarding worktree $2 loses and keeps, from the evaluate that just ran.
+show_discard() {  # TAG INDEX
+  local tag="$1" wi="$2" line kind n files_age="-" pr="$PR"
+  [ -n "$D_NEWEST" ] && files_age="$(ago $(( $(now) - D_NEWEST ))) ago"
+  [ "$pr" = "-" ] && pr="not checked"
+  say "$tag ${C_REMOVE}DISCARD?${C_0} $(display_path "${W_PATH[$wi]}")  $(human "${SIZE_KB:-0}")"
+  printf '    %s · PR %s · last commit %sd ago · files last changed %s\n' \
+    "${W_BRANCH[$wi]:-(detached HEAD)}" "$pr" "$AGE" "$files_age"
+  for kind in changes ignored; do
+    if [ "$kind" = changes ]; then
+      [ "$CHANGES" -gt 0 ] || continue
+      printf '    %d change(s), saved to the stash first:\n' "$CHANGES"
+    else
+      [ "$D_KEPT_N" -gt 0 ] || continue
+      printf '    %d ignored file(s) or folder(s), deleted with no copy:\n' "$D_KEPT_N"
+    fi
+    n=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$line" in '!! '*) [ "$kind" = ignored ] || continue ;; *) [ "$kind" = changes ] || continue ;; esac
+      n=$((n + 1))
+      [ "$n" -le 10 ] && printf '      %s\n' "$line"
+    done <<<"$D_SHOW"
+    [ "$n" -gt 10 ] && printf '      … and %d more\n' $((n - 10))
+  done
+  if [ -z "${W_BRANCH[$wi]}" ]; then printf '    kept: nothing to keep, HEAD is already on a remote\n'
+  elif [ "$UNPUSHED" = 0 ]; then printf '    kept: branch %s\n' "${W_BRANCH[$wi]}"
+  else printf '    kept: branch %s, with %s commit(s) that are on no remote\n' "${W_BRANCH[$wi]}" "$UNPUSHED"
+  fi
+}
+
+if [ ${#DPLAN[@]} -gt 0 ]; then
+  if ! open_tty; then
+    # --yes never answers for these: without a terminal they are not even offered.
+    say "${C_REVIEW}NOT OFFERED${C_0} ${#DPLAN[@]} worktree(s) kept only by local files: --discard asks about each one, and there is no terminal to ask"
+  else
+    step=0; total_steps=${#DPLAN[@]}
+    for i in "${DPLAN[@]}"; do
+      step=$((step + 1)); tag="[$step/$total_steps]"
+      wt=${W_PATH[$i]}; ri=${W_REPO[$i]}; repo=${R_PATH[$ri]}; br=${W_BRANCH[$i]}
+      progress "$tag re-checking $(display_path "$wt")…"
+      CWDS=""; collect_cwds
+      FRESH=yes evaluate "$i"
+      if [ "$DISCARDABLE" != yes ]; then
+        say "$tag ${C_REVIEW}SKIP${C_0}    $(display_path "$wt") — now $V: $WHY${D_NOT:+ ($D_NOT)}"
+        skipped=$((skipped + 1)); continue
+      fi
+      echo
+      show_discard "$tag" "$i"
+      ask "Discard these and remove the worktree? [y/N/q] " || ANS=""
+      case "$ANS" in
+        y|Y|yes) ;;
+        q|Q|quit) say "Stopped. The rest were left alone."; break ;;
+        *) say "$tag ${C_KEEP}KEPT${C_0}    $(display_path "$wt")"; declined=$((declined + 1)); continue ;;
+      esac
+      # The answer may have taken minutes: look again, and act only on what was shown.
+      fp=$D_FP
+      CWDS=""; collect_cwds
+      FRESH=yes evaluate "$i"
+      if [ "$DISCARDABLE" != yes ] || [ "$D_FP" != "$fp" ]; then
+        say "$tag ${C_REVIEW}SKIP${C_0}    $(display_path "$wt") — changed while you were deciding; nothing discarded"
+        skipped=$((skipped + 1)); continue
+      fi
+      t0=$(now); stashed=""
+      if [ "$CHANGES" -gt 0 ]; then
+        # Literal pathspecs off for this call only: under them, stash saves untracked files
+        # but cannot clean them away (its internal pathspec is taken literally).
+        if ! err=$(GIT_LITERAL_PATHSPECS=0 git -C "$wt" stash push --include-untracked --quiet \
+                     -m "git-worktree-clean: discarded from $wt${br:+ ($br)}" 2>&1); then
+          say "$tag ${C_REMOVE}FAILED${C_0}  $(display_path "$wt"): could not stash its changes, so nothing was removed: $err"
+          failed=$((failed + 1)); continue
+        fi
+        stashed=$(git -C "$wt" rev-parse --short refs/stash 2>/dev/null)
+      fi
+      # Still no --force: after the stash only ignored files are left, and git removes those.
+      progress "$tag removing $(display_path "$wt") ($(human "${SIZE_KB:-0}"))…"
+      if err=$(git -C "$repo" worktree remove "$wt" 2>&1); then
+        kb_freed=$((kb_freed + ${SIZE_KB:-0})); discarded=$((discarded + 1))
+        note="${stashed:+changes in stash $stashed}"
+        [ -n "$br" ] && note+="${note:+ · }branch $br kept"
+        say "$tag ${C_KEEP}DISCARDED${C_0} $(display_path "$wt")  $(human "${SIZE_KB:-0}") in $(( $(now) - t0 ))s  ${C_DIM}${note}${C_0}"
+      else
+        failed=$((failed + 1))
+        say "$tag ${C_REMOVE}FAILED${C_0}  $(display_path "$wt"): $err${stashed:+ (its changes are in stash $stashed; restore with: git -C \"$wt\" stash apply $stashed)}"
+      fi
+    done
+  fi
+fi
+progress_done
+
 FREE1=$(disk_free_kb "${ROOT_DIRS[0]}")
 echo
-printf '%sDone%s in %ds: %d done, %d skipped, %d failed\n' "$C_B" "$C_0" "$(( $(now) - START ))" "$done_n" "$skipped" "$failed"
+counts="$done_n done"; [ "$DISCARD" = yes ] && counts+=", $discarded discarded, $declined kept at your answer"
+printf '%sDone%s in %ds: %s, %d skipped, %d failed\n' "$C_B" "$C_0" "$(( $(now) - START ))" "$counts" "$skipped" "$failed"
 printf '  freed:     %s%s%s  (sum of removed worktree sizes)\n' "$C_B" "$(human "$kb_freed")" "$C_0"
+[ "$discarded" -gt 0 ] && printf '  undo:      discarded changes are in each repository'"'"'s %sgit stash list%s\n' "$C_B" "$C_0"
 printf '  disk free: %s → %s of %s  %s(some filesystems release space a moment later)%s\n' \
   "$(human "$FREE0")" "$(human "$FREE1")" "$(human "$TOTAL")" "$C_DIM" "$C_0"
 [ "$failed" -eq 0 ] || exit 1

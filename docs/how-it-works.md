@@ -37,6 +37,33 @@ REVIEW, never REMOVE: not being able to look is not the same as finding nothing.
   submodules) is a second safety net.
 - Local branches are kept unless you pass `--delete-branches`.
 
+## `remove --discard`: worktrees kept only by local files
+
+Some KEEP rows are held back by nothing but files in the folder: uncommitted changes,
+untracked files, or ignored files that are not disposable. `--discard` offers those, one
+at a time, when all of these hold:
+
+- not locked, and no process has its current folder inside it;
+- no open pull request, and the pull-request lookup worked (a failed lookup is not read as
+  "no pull request"; with `--no-forge` or a non-GitHub remote the prompt says "not checked");
+- nothing committed is lost: a branch keeps its commits (the prompt says how many are on no
+  remote), and a detached HEAD must already be on a remote.
+
+For each one it shows the branch, the pull request, the age of the last commit and of the
+newest file, every file that would go (the first ten of each kind), and what is kept. The
+default answer is no; `q` stops asking. `--yes` never answers this question, and without a
+terminal nothing is offered.
+
+After a yes it looks again. If the files changed while you were deciding (a new file, a
+changed modification time), or the worktree no longer qualifies, it is skipped. Otherwise
+tracked and untracked changes are saved with `git stash push --include-untracked`, which
+all worktrees of a repository share, so `git stash list` in the main folder gets them back.
+Then `git worktree remove` runs, still without `--force`: it deletes the ignored files,
+which are not stashed. The branch is kept even with `--delete-branches`.
+
+Untracked files are copied into the repository's object store by the stash, so a large
+untracked file takes that space until the stash entry is dropped.
+
 ## Disposable ignored files
 
 `git worktree remove` deletes ignored files and git keeps no copy, so each one is checked.
